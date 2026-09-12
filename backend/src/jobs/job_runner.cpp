@@ -120,4 +120,44 @@ Result<void> JobRunner::request_cancel(const std::string& id) {
     return Result<void>::Ok();
 }
 
+Result<void> JobRunner::request_pause(const std::string& id) {
+    std::shared_ptr<CancellationToken> cancellation;
+    {
+        std::lock_guard lock(cancellation_mutex_);
+        const auto it = active_cancellations_.find(id);
+        if (it != active_cancellations_.end()) {
+            cancellation = it->second;
+        }
+    }
+
+    if (cancellation != nullptr) {
+        cancellation->paused.store(true);
+        log_info("Pause requested for job " + id + "; active pipeline token signaled.");
+    } else {
+        log_info("Pause requested for job " + id + " while not active.");
+    }
+
+    return Result<void>::Ok();
+}
+
+Result<void> JobRunner::request_resume(const std::string& id) {
+    std::shared_ptr<CancellationToken> cancellation;
+    {
+        std::lock_guard lock(cancellation_mutex_);
+        const auto it = active_cancellations_.find(id);
+        if (it != active_cancellations_.end()) {
+            cancellation = it->second;
+        }
+    }
+
+    if (cancellation != nullptr) {
+        cancellation->paused.store(false);
+        log_info("Resume requested for job " + id + "; active pipeline token signaled.");
+    } else {
+        log_info("Resume requested for job " + id + " while not active.");
+    }
+
+    return Result<void>::Ok();
+}
+
 } // namespace vsr

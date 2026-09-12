@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -39,6 +40,9 @@ struct OutputSettings {
     std::string video_codec = "h264";
     std::string audio_mode = "copy";
     std::string subtitle_mode = "copy-compatible";
+    // Optional NVENC encoder option overrides. Applied on top of the built-in
+    // defaults in configure_nvenc_quality; values go to av_opt_set verbatim.
+    std::map<std::string, std::string> encoder_options;
 };
 
 struct TranscodeRequest {
@@ -99,6 +103,7 @@ struct JobRecord {
 
 struct CancellationToken {
     std::atomic_bool requested{false};
+    std::atomic_bool paused{false};
 };
 
 inline std::string normalized_path_key(std::string path) {
@@ -161,9 +166,6 @@ inline Result<void> validate_request(const TranscodeRequest& request) {
     if (!request.processing.vsr.enabled && !request.processing.hdr.enabled) {
         return Result<void>::Fail({"processing_required", "Enable VSR, HDR, or both.", ""});
     }
-    if (request.output.container != "mp4") {
-        return Result<void>::Fail({"unsupported_container", "The first backend release writes MP4 output.", request.output.container});
-    }
     if (request.output.video_codec != "h264" && request.output.video_codec != "hevc" &&
         request.output.video_codec != "av1") {
         return Result<void>::Fail({"unsupported_video_codec", "Use h264, hevc, or av1 for MP4 output.", request.output.video_codec});
@@ -173,6 +175,24 @@ inline Result<void> validate_request(const TranscodeRequest& request) {
     }
     if (request.output.subtitle_mode != "copy-compatible" && request.output.subtitle_mode != "none") {
         return Result<void>::Fail({"unsupported_subtitle_mode", "Use copy-compatible or none for subtitleMode.", request.output.subtitle_mode});
+    }
+    for (const auto& [name, value] : request.output.encoder_options) {
+        static constexpr const char* kAllowedEncoderOptions[] = {
+            "preset", "tune", "rc", "cq", "qp", "b:v", "maxrate", "bufsize",
+            "spatial-aq", "temporal-aq", "aq-strength", "rc-lookahead", "multipass", "g"};
+        bool allowed = false;
+        for (const char* candidate : kAllowedEncoderOptions) {
+            if (name == candidate) {
+                allowed = true;
+                break;
+            }
+        }
+        if (!allowed) {
+            return Result<void>::Fail({"unsupported_encoder_option", "Unknown NVENC encoder option.", name});
+        }
+        if (value.empty() || value.size() > 64) {
+            return Result<void>::Fail({"invalid_encoder_option_value", "Encoder option values must be 1-64 characters.", name});
+        }
     }
     if (request.processing.vsr.enabled && (request.processing.vsr.quality < 1 || request.processing.vsr.quality > 4)) {
         return Result<void>::Fail({"invalid_vsr_quality", "VSR quality must be between 1 and 4.", std::to_string(request.processing.vsr.quality)});

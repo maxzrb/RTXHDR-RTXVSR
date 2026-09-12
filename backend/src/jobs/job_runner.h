@@ -15,6 +15,8 @@ public:
     JobRunner(JobStore& store, std::unique_ptr<VideoPipeline> pipeline);
     Result<void> run_one(const std::string& id);
     Result<void> request_cancel(const std::string& id);
+    Result<void> request_pause(const std::string& id);
+    Result<void> request_resume(const std::string& id);
 
 private:
     std::mutex run_mutex_;

@@ -12,9 +12,11 @@
 #include <filesystem>
 #include <iomanip>
 #include <limits>
+#include <chrono>
 #include <sstream>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -45,16 +47,6 @@ extern "C" {
 #endif
 
 namespace vsr {
-
-bool ffmpeg_muxer_supports_copy(const AVOutputFormat* format, int codec_id) {
-    if (format == nullptr || codec_id == AV_CODEC_ID_NONE) {
-        return false;
-    }
-    return avformat_query_codec(
-               format,
-               static_cast<AVCodecID>(codec_id),
-               FF_COMPLIANCE_NORMAL) > 0;
-}
 
 Result<void> ffmpeg_copy_display_matrix(
     const AVCodecParameters* source,
@@ -215,6 +207,22 @@ Result<void> set_required_encoder_option_int(AVCodecContext* context, const char
     return Result<void>::Ok();
 }
 
+// Blocks the calling pipeline thread while the job is paused. Cancel always
+// wins over pause so a stopped job never waits on the pause flag.
+void wait_while_job_paused(CancellationToken& cancellation) {
+    bool logged = false;
+    while (cancellation.paused.load() && !cancellation.requested.load()) {
+        if (!logged) {
+            log_info("Pipeline paused by request.");
+            logged = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (logged && !cancellation.requested.load()) {
+        log_info("Pipeline resumed.");
+    }
+}
+
 void set_optional_encoder_option_int(AVCodecContext* context, const char* name, std::int64_t value) {
     const int result = av_opt_set_int(context->priv_data, name, value, 0);
     if (result < 0) {
@@ -249,6 +257,16 @@ Result<void> configure_nvenc_quality(AVCodecContext* context, const OutputSettin
         const auto configured = set_required_encoder_option_int(context, option.first, option.second);
         if (!configured.ok()) {
             return configured;
+        }
+    }
+    // Caller-provided overrides win over the built-in defaults above. Option
+    // names were already validated against the allowlist in validate_request.
+    // Invalid values (e.g. unsupported tune presets) fall back to the default
+    // with a warning instead of failing the whole job.
+    for (const auto& [name, value] : output.encoder_options) {
+        const int result = av_opt_set(context->priv_data, name.c_str(), value.c_str(), 0);
+        if (result < 0) {
+            log_info(std::string("Skipping unsupported NVENC option: ") + name);
         }
     }
     if (enable_split_encode) {
@@ -738,7 +756,7 @@ Result<BufferRefPtr> create_encoder_frames_context(
     return Result<BufferRefPtr>::Ok(std::move(frames_ref));
 }
 
-Result<void> drain_encoder(AVCodecContext* encoder, AVFormatContext* output, AVStream* stream, AVPacket* packet) {
+Result<void> drain_encoder(AVCodecContext* encoder, AVFormatContext* output, AVStream* stream, AVPacket* packet, std::int64_t input_start_time_us) {
     for (;;) {
         av_packet_unref(packet);
         const int result = avcodec_receive_packet(encoder, packet);
@@ -754,6 +772,19 @@ Result<void> drain_encoder(AVCodecContext* encoder, AVFormatContext* output, AVS
 
         packet->stream_index = stream->index;
         av_packet_rescale_ts(packet, encoder->time_base, stream->time_base);
+        if (input_start_time_us > 0) {
+            // Blu-ray m2ts sources commonly carry a large start timestamp
+            // baseline (e.g. 600s). Strip it so the output timeline starts at
+            // zero, mirroring the ffmpeg CLI's default behavior for direct
+            // libavformat muxing.
+            const auto shift = av_rescale_q(input_start_time_us, AV_TIME_BASE_Q, stream->time_base);
+            if (packet->pts != AV_NOPTS_VALUE) {
+                packet->pts = std::max<std::int64_t>(0, packet->pts - shift);
+            }
+            if (packet->dts != AV_NOPTS_VALUE) {
+                packet->dts = std::max<std::int64_t>(0, packet->dts - shift);
+            }
+        }
 
         const int write_result = av_interleaved_write_frame(output, packet);
         if (write_result < 0) {
@@ -874,6 +905,13 @@ Result<void> FfmpegTranscodePipeline::run(
             result));
     }
 
+    // Blu-ray m2ts sources commonly carry a large start timestamp baseline
+    // (e.g. 600s). Strip it from every muxed packet so the output timeline
+    // starts at zero, mirroring the ffmpeg CLI's default behavior for direct
+    // libavformat muxing.
+    const std::int64_t input_start_time_us =
+        (input->start_time != AV_NOPTS_VALUE && input->start_time > 0) ? input->start_time : 0;
+
     const int video_stream_index = find_primary_video_stream(input.get());
     if (video_stream_index < 0) {
         return Result<void>::Fail({"video_stream_missing", "Input file does not contain a video stream.", request.input_path});
@@ -944,12 +982,30 @@ Result<void> FfmpegTranscodePipeline::run(
     }
 
     AVFormatContext* raw_output = nullptr;
+    const std::string final_output_string = path_to_utf8(final_output_path);
     const std::string temporary_output_string = path_to_utf8(temporary_output_path);
-    result = avformat_alloc_output_context2(&raw_output, nullptr, "mp4", temporary_output_string.c_str());
+    // "auto" guesses the muxer from the final output file extension, so every
+    // container FFmpeg supports can be targeted directly; feature combinations
+    // the target container cannot hold surface as the muxer's own errors when
+    // the header is written.
+    const char* output_format_name = nullptr;
+    if (request.output.container != "auto" && !request.output.container.empty()) {
+        output_format_name = request.output.container.c_str();
+    } else {
+        const AVOutputFormat* guessed = av_guess_format(nullptr, final_output_string.c_str(), nullptr);
+        if (guessed == nullptr) {
+            return Result<void>::Fail({
+                "unsupported_container",
+                "FFmpeg has no muxer for this output file extension.",
+                final_output_string});
+        }
+        output_format_name = guessed->name;
+    }
+    result = avformat_alloc_output_context2(&raw_output, nullptr, output_format_name, temporary_output_string.c_str());
     if (result < 0 || raw_output == nullptr) {
         return Result<void>::Fail(result < 0
-            ? ffmpeg_error("output_context_alloc_failed", "FFmpeg could not create an MP4 output context.", result)
-            : Error{"output_context_alloc_failed", "FFmpeg could not create an MP4 output context.", temporary_output_string});
+            ? ffmpeg_error("output_context_alloc_failed", "FFmpeg could not create an output context.", result)
+            : Error{"output_context_alloc_failed", "FFmpeg could not create an output context.", temporary_output_string});
     }
     OutputFormatContextPtr output(raw_output);
 
@@ -1126,18 +1182,21 @@ Result<void> FfmpegTranscodePipeline::run(
                 if (request.output.audio_mode != "copy") {
                     continue;
                 }
-                if (!ffmpeg_muxer_supports_copy(output->oformat, source_stream->codecpar->codec_id)) {
+                // MPEG-TS/Blu-ray demuxing often leaves audio parameters unset.
+                // TrueHD is a fixed-rate codec and Matroska refuses to write an
+                // audio track without a sample rate, so fill in the known value.
+                if (source_stream->codecpar->codec_id == AV_CODEC_ID_TRUEHD &&
+                    source_stream->codecpar->sample_rate == 0) {
+                    source_stream->codecpar->sample_rate = 48000;
+                }
+                if (source_stream->codecpar->sample_rate <= 0 ||
+                    source_stream->codecpar->ch_layout.nb_channels <= 0) {
                     report_warning(
-                        "Skipped MP4-incompatible audio stream (" + codec_details(source_stream) + ").");
+                        "Skipped audio stream with incomplete stream parameters (" + codec_details(source_stream) + ").");
                     continue;
                 }
             } else if (media_type == AVMEDIA_TYPE_SUBTITLE) {
                 if (request.output.subtitle_mode != "copy-compatible") {
-                    continue;
-                }
-                if (!ffmpeg_muxer_supports_copy(output->oformat, source_stream->codecpar->codec_id)) {
-                    report_warning(
-                        "Skipped MP4-incompatible subtitle stream (" + codec_details(source_stream) + ").");
                     continue;
                 }
             } else {
@@ -1152,7 +1211,7 @@ Result<void> FfmpegTranscodePipeline::run(
             if (result < 0) {
                 return Result<void>::Fail(ffmpeg_error(
                     "copy_stream_parameters_failed",
-                    "FFmpeg could not copy input stream parameters to the MP4 output.",
+                    "FFmpeg could not copy input stream parameters to the output.",
                     result));
             }
             copied_stream->codecpar->codec_tag = 0;
@@ -1182,7 +1241,9 @@ Result<void> FfmpegTranscodePipeline::run(
     if (result < 0) {
         return Result<void>::Fail(ffmpeg_error(
             "output_header_failed",
-            "FFmpeg could not write the MP4 header.",
+            (std::string("FFmpeg could not write the ") +
+             (output->oformat != nullptr && output->oformat->name != nullptr ? output->oformat->name : "output") +
+             " header. The target container likely cannot hold one of the streams.").c_str(),
             result));
     }
 
@@ -1246,6 +1307,7 @@ Result<void> FfmpegTranscodePipeline::run(
     };
 
     auto process_decoded_frame = [&](AVFrame* frame) -> Result<void> {
+        wait_while_job_paused(cancellation);
         if (cancellation.requested.load()) {
             return canceled_result("before processing decoded frame");
         }
@@ -1410,7 +1472,7 @@ Result<void> FfmpegTranscodePipeline::run(
         ++frames_done;
         emit_progress(JobStage::encoding, frames_done);
 
-        return drain_encoder(encoder_context.get(), output.get(), output_stream, encoder_packet.get());
+        return drain_encoder(encoder_context.get(), output.get(), output_stream, encoder_packet.get(), input_start_time_us);
     };
 
     auto receive_decoder_frames = [&]() -> Result<void> {
@@ -1438,6 +1500,7 @@ Result<void> FfmpegTranscodePipeline::run(
         if (cancellation.requested.load()) {
             return canceled_result("while reading input");
         }
+        wait_while_job_paused(cancellation);
         av_packet_unref(packet.get());
         result = av_read_frame(input.get(), packet.get());
         if (result == AVERROR_EOF) {
@@ -1456,6 +1519,15 @@ Result<void> FfmpegTranscodePipeline::run(
                     AVStream* source_stream = input->streams[packet->stream_index];
                     packet->stream_index = copied_stream->index;
                     av_packet_rescale_ts(packet.get(), source_stream->time_base, copied_stream->time_base);
+                    if (input_start_time_us > 0) {
+                        const auto shift = av_rescale_q(input_start_time_us, AV_TIME_BASE_Q, copied_stream->time_base);
+                        if (packet->pts != AV_NOPTS_VALUE) {
+                            packet->pts = std::max<std::int64_t>(0, packet->pts - shift);
+                        }
+                        if (packet->dts != AV_NOPTS_VALUE) {
+                            packet->dts = std::max<std::int64_t>(0, packet->dts - shift);
+                        }
+                    }
                     const int write_result = av_interleaved_write_frame(output.get(), packet.get());
                     if (write_result < 0) {
                         return Result<void>::Fail(ffmpeg_error(
@@ -1508,7 +1580,7 @@ Result<void> FfmpegTranscodePipeline::run(
             "NVENC could not flush.",
             result));
     }
-    const auto encoded_flush = drain_encoder(encoder_context.get(), output.get(), output_stream, encoder_packet.get());
+    const auto encoded_flush = drain_encoder(encoder_context.get(), output.get(), output_stream, encoder_packet.get(), input_start_time_us);
     if (!encoded_flush.ok()) {
         return Result<void>::Fail(encoded_flush.error());
     }

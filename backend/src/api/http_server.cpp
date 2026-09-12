@@ -237,6 +237,34 @@ void HttpServer::bind_routes() {
 
         set_json(response, {{"accepted", true}});
     });
+
+    server_.Post(R"(/api/jobs/([^/]+)/pause)", [this](const httplib::Request& request, httplib::Response& response) {
+        if (!authorize_request(request, response, options_)) {
+            return;
+        }
+        const auto paused = runner_.request_pause(request.matches[1].str());
+        if (!paused.ok()) {
+            response.status = status_for_cancel_error(paused.error());
+            set_json(response, error_to_json(paused.error()));
+            return;
+        }
+
+        set_json(response, {{"accepted", true}});
+    });
+
+    server_.Post(R"(/api/jobs/([^/]+)/resume)", [this](const httplib::Request& request, httplib::Response& response) {
+        if (!authorize_request(request, response, options_)) {
+            return;
+        }
+        const auto resumed = runner_.request_resume(request.matches[1].str());
+        if (!resumed.ok()) {
+            response.status = status_for_cancel_error(resumed.error());
+            set_json(response, error_to_json(resumed.error()));
+            return;
+        }
+
+        set_json(response, {{"accepted", true}});
+    });
 }
 
 void HttpServer::worker_loop() {

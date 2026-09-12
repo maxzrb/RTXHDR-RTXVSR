@@ -291,15 +291,6 @@ TEST(FfmpegTranscodePipelineOutput, writesUtf8OutputPathThroughFfmpegAvio) {
     std::filesystem::remove_all(directory, ignored);
 }
 
-TEST(FfmpegTranscodePipelineStreams, usesMp4MuxerCompatibilityIncludingOpus) {
-    const AVOutputFormat* mp4 = av_guess_format("mp4", nullptr, nullptr);
-
-    ASSERT_NE(mp4, nullptr);
-    EXPECT_TRUE(vsr::ffmpeg_muxer_supports_copy(mp4, AV_CODEC_ID_OPUS));
-    EXPECT_TRUE(vsr::ffmpeg_muxer_supports_copy(mp4, AV_CODEC_ID_MOV_TEXT));
-    EXPECT_FALSE(vsr::ffmpeg_muxer_supports_copy(mp4, AV_CODEC_ID_SUBRIP));
-}
-
 TEST(FfmpegTranscodePipelineStreams, copiesInputDisplayMatrixToEncodedVideoParameters) {
     const auto parameters_deleter = [](AVCodecParameters* parameters) {
         avcodec_parameters_free(&parameters);

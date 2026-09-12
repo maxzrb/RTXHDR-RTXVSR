@@ -29,6 +29,18 @@ Result<TranscodeRequest> parse_transcode_request(const nlohmann::json& json) {
         request.output.audio_mode = output.value("audioMode", "copy");
         request.output.subtitle_mode = output.value("subtitleMode", "copy-compatible");
 
+        if (output.contains("encoderOptions") && output.at("encoderOptions").is_object()) {
+            for (const auto& [name, value] : output.at("encoderOptions").items()) {
+                if (value.is_string()) {
+                    request.output.encoder_options[name] = value.get<std::string>();
+                } else if (value.is_boolean()) {
+                    request.output.encoder_options[name] = value.get<bool>() ? "1" : "0";
+                } else if (value.is_number()) {
+                    request.output.encoder_options[name] = value.dump();
+                }
+            }
+        }
+
         const auto valid = validate_request(request);
         if (!valid.ok()) {
             return Result<TranscodeRequest>::Fail(valid.error());

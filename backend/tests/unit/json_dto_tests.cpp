@@ -73,6 +73,44 @@ TEST(JsonDto, ParsesAv1OutputCodec) {
     EXPECT_EQ(parsed.value().output.video_codec, "av1");
 }
 
+TEST(JsonDto, ParsesEncoderOptionsAndCoercesScalarValues) {
+    const auto json = nlohmann::json::parse(R"json({
+      "inputPath": "C:\\Videos\\in.mp4",
+      "outputPath": "C:\\Videos\\out.mp4",
+      "processing": { "vsr": { "enabled": true } },
+      "output": {
+        "container": "mp4",
+        "videoCodec": "hevc",
+        "encoderOptions": { "cq": 28, "preset": "p7", "spatial-aq": true, "rc": "vbr" }
+      }
+    })json");
+
+    const auto parsed = parse_transcode_request(json);
+
+    ASSERT_TRUE(parsed.ok()) << parsed.error().message;
+    const auto& options = parsed.value().output.encoder_options;
+    EXPECT_EQ(options.size(), 4u);
+    EXPECT_EQ(options.at("cq"), "28");
+    EXPECT_EQ(options.at("preset"), "p7");
+    EXPECT_EQ(options.at("spatial-aq"), "1");
+    EXPECT_EQ(options.at("rc"), "vbr");
+}
+
+TEST(JsonDto, RejectsUnknownEncoderOption) {
+    const auto json = nlohmann::json::parse(R"json({
+      "inputPath": "C:\\Videos\\in.mp4",
+      "outputPath": "C:\\Videos\\out.mp4",
+      "processing": { "vsr": { "enabled": true } },
+      "output": { "encoderOptions": { "made-up-option": "1" } }
+    })json");
+
+    const auto parsed = parse_transcode_request(json);
+
+    ASSERT_FALSE(parsed.ok());
+    EXPECT_EQ(parsed.error().code, "unsupported_encoder_option");
+    EXPECT_EQ(parsed.error().details, "made-up-option");
+}
+
 TEST(JsonDto, ReturnsStructuredValidationErrorForInvalidRequestJson) {
     const auto json = nlohmann::json::parse(R"json({
       "inputPath": "C:\\Videos\\in.mp4",
