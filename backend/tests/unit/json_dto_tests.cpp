@@ -12,7 +12,7 @@ TEST(JsonDto, ParsesPlanJsonFields) {
         "vsr": { "enabled": true, "quality": 2, "scale": 2.5 },
         "hdr": { "enabled": true, "contrast": 90, "saturation": 80, "middleGray": 48, "maxLuminance": 1200 }
       },
-      "output": { "container": "mp4", "videoCodec": "hevc", "audioMode": "copy", "subtitleMode": "copy-compatible" }
+      "output": { "container": "mp4", "videoCodec": "hevc", "pixelFormat": "p010le", "audioMode": "none", "subtitleMode": "none", "framePipePath": "\\\\.\\pipe\\videoenhancer-rtx-test", "audioStreamIndices": [0, 2], "subtitleStreamIndices": [] }
     })json");
 
     const auto parsed = parse_transcode_request(json);
@@ -30,8 +30,14 @@ TEST(JsonDto, ParsesPlanJsonFields) {
     EXPECT_EQ(parsed.value().processing.hdr.max_luminance, 1200);
     EXPECT_EQ(parsed.value().output.container, "mp4");
     EXPECT_EQ(parsed.value().output.video_codec, "hevc");
-    EXPECT_EQ(parsed.value().output.audio_mode, "copy");
-    EXPECT_EQ(parsed.value().output.subtitle_mode, "copy-compatible");
+    EXPECT_EQ(parsed.value().output.pixel_format, "p010le");
+    EXPECT_EQ(parsed.value().output.audio_mode, "none");
+    EXPECT_EQ(parsed.value().output.subtitle_mode, "none");
+    EXPECT_EQ(parsed.value().output.frame_pipe_path, "\\\\.\\pipe\\videoenhancer-rtx-test");
+    ASSERT_TRUE(parsed.value().output.audio_stream_indices.has_value());
+    EXPECT_EQ(parsed.value().output.audio_stream_indices.value(), (std::vector<int>{0, 2}));
+    ASSERT_TRUE(parsed.value().output.subtitle_stream_indices.has_value());
+    EXPECT_TRUE(parsed.value().output.subtitle_stream_indices->empty());
 }
 
 TEST(JsonDto, DefaultsOutputFieldsAndChoosesCodecFromHdr) {
@@ -57,6 +63,9 @@ TEST(JsonDto, DefaultsOutputFieldsAndChoosesCodecFromHdr) {
 
     ASSERT_TRUE(vsr.ok()) << vsr.error().message;
     EXPECT_EQ(vsr.value().output.video_codec, "h264");
+    EXPECT_EQ(vsr.value().output.pixel_format, "auto");
+    EXPECT_FALSE(vsr.value().output.audio_stream_indices.has_value());
+    EXPECT_FALSE(vsr.value().output.subtitle_stream_indices.has_value());
 }
 
 TEST(JsonDto, ParsesAv1OutputCodec) {

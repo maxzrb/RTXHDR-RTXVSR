@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -38,8 +39,14 @@ struct ProcessingSettings {
 struct OutputSettings {
     std::string container = "mp4";
     std::string video_codec = "h264";
+    std::string pixel_format = "auto";
     std::string audio_mode = "copy";
     std::string subtitle_mode = "copy-compatible";
+    // 非空时只把 RTX 处理后的原始视频帧写入命名管道，最终编码由 3FUI FFmpeg 完成。
+    std::string frame_pipe_path;
+    // nullopt 保持历史行为（复制该类型全部流）；空数组表示显式不选该类型。
+    std::optional<std::vector<int>> audio_stream_indices;
+    std::optional<std::vector<int>> subtitle_stream_indices;
     // Optional NVENC encoder option overrides. Applied on top of the built-in
     // defaults in configure_nvenc_quality; values go to av_opt_set verbatim.
     std::map<std::string, std::string> encoder_options;
@@ -170,11 +177,38 @@ inline Result<void> validate_request(const TranscodeRequest& request) {
         request.output.video_codec != "av1") {
         return Result<void>::Fail({"unsupported_video_codec", "Use h264, hevc, or av1 for MP4 output.", request.output.video_codec});
     }
+    if (request.output.pixel_format != "auto" && request.output.pixel_format != "nv12" &&
+        request.output.pixel_format != "p010le") {
+        return Result<void>::Fail({"unsupported_pixel_format", "Use auto, nv12, or p010le for pixelFormat.", request.output.pixel_format});
+    }
+    if (request.output.frame_pipe_path.empty()
+        && request.output.video_codec == "h264"
+        && request.output.pixel_format == "p010le") {
+        return Result<void>::Fail({"h264_10bit_unsupported", "H.264 NVENC does not support the requested 10-bit output on this pipeline.", request.output.pixel_format});
+    }
     if (request.output.audio_mode != "copy" && request.output.audio_mode != "none") {
         return Result<void>::Fail({"unsupported_audio_mode", "Use copy or none for audioMode.", request.output.audio_mode});
     }
     if (request.output.subtitle_mode != "copy-compatible" && request.output.subtitle_mode != "none") {
         return Result<void>::Fail({"unsupported_subtitle_mode", "Use copy-compatible or none for subtitleMode.", request.output.subtitle_mode});
+    }
+    if (!request.output.frame_pipe_path.empty()) {
+        if (request.output.frame_pipe_path.rfind("\\\\.\\pipe\\videoenhancer-rtx-", 0) != 0) {
+            return Result<void>::Fail({"invalid_frame_pipe", "RTX frame output must use a VideoEnhancer named pipe.", request.output.frame_pipe_path});
+        }
+        if (request.output.audio_mode != "none" || request.output.subtitle_mode != "none") {
+            return Result<void>::Fail({"frame_pipe_video_only", "Frame-pipe jobs must leave audio and subtitles to the host FFmpeg process.", ""});
+        }
+    }
+    for (const auto* indices : {&request.output.audio_stream_indices, &request.output.subtitle_stream_indices}) {
+        if (!indices->has_value()) continue;
+        int previous = -1;
+        for (const int index : indices->value()) {
+            if (index < 0 || index <= previous) {
+                return Result<void>::Fail({"invalid_stream_selection", "Stream indices must be non-negative, unique, and sorted.", std::to_string(index)});
+            }
+            previous = index;
+        }
     }
     for (const auto& [name, value] : request.output.encoder_options) {
         static constexpr const char* kAllowedEncoderOptions[] = {

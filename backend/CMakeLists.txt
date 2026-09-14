@@ -17,6 +17,10 @@ if(MSVC AND VSR_ENABLE_RTX_SDK)
 endif()
 
 set(CMAKE_CXX_STANDARD 20)
+if(MSVC)
+  # 源文件统一按 UTF-8 解析，避免中文注释被本机代码页误读。
+  add_compile_options(/utf-8)
+endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 

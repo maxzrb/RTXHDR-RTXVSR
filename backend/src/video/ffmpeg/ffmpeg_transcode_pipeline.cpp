@@ -23,6 +23,7 @@
 #if defined(_WIN32)
 #include <d3d11.h>
 #include <d3d11_1.h>
+#include <dxgi.h>
 #include <wrl/client.h>
 #endif
 
@@ -181,6 +182,78 @@ static Error ffmpeg_error(const char* code, const char* message, int ffmpeg_code
     char buffer[AV_ERROR_MAX_STRING_SIZE] = {};
     av_strerror(ffmpeg_code, buffer, sizeof(buffer));
     return {code, message, buffer};
+}
+
+Result<void> convert_software_frame_for_d3d11_upload(
+    const AVFrame* source,
+    AVFrame* destination,
+    AVPixelFormat destination_format) {
+    if (source == nullptr || destination == nullptr) {
+        return Result<void>::Fail({
+            "software_decode_conversion_failed",
+            "FFmpeg could not convert the low-resolution frame for D3D11 upload.",
+            "Source or destination frame was null."
+        });
+    }
+
+    const auto source_format = static_cast<AVPixelFormat>(source->format);
+    const int width = source->width;
+    const int height = source->height;
+    const int chroma_width = (width + 1) / 2;
+    const int chroma_height = (height + 1) / 2;
+
+    if (source_format == AV_PIX_FMT_YUV420P && destination_format == AV_PIX_FMT_NV12) {
+        for (int y = 0; y < height; ++y) {
+            std::memcpy(
+                destination->data[0] + y * destination->linesize[0],
+                source->data[0] + y * source->linesize[0],
+                static_cast<std::size_t>(width));
+        }
+        for (int y = 0; y < chroma_height; ++y) {
+            const auto* source_u = source->data[1] + y * source->linesize[1];
+            const auto* source_v = source->data[2] + y * source->linesize[2];
+            auto* destination_uv = destination->data[1] + y * destination->linesize[1];
+            for (int x = 0; x < chroma_width; ++x) {
+                destination_uv[x * 2] = source_u[x];
+                destination_uv[x * 2 + 1] = source_v[x];
+            }
+        }
+        return Result<void>::Ok();
+    }
+
+    if (source_format == AV_PIX_FMT_YUV420P10LE && destination_format == AV_PIX_FMT_P010LE) {
+        for (int y = 0; y < height; ++y) {
+            const auto* source_y = reinterpret_cast<const std::uint16_t*>(
+                source->data[0] + y * source->linesize[0]);
+            auto* destination_y = reinterpret_cast<std::uint16_t*>(
+                destination->data[0] + y * destination->linesize[0]);
+            for (int x = 0; x < width; ++x) {
+                destination_y[x] = static_cast<std::uint16_t>((source_y[x] & 0x03ffU) << 6U);
+            }
+        }
+        for (int y = 0; y < chroma_height; ++y) {
+            const auto* source_u = reinterpret_cast<const std::uint16_t*>(
+                source->data[1] + y * source->linesize[1]);
+            const auto* source_v = reinterpret_cast<const std::uint16_t*>(
+                source->data[2] + y * source->linesize[2]);
+            auto* destination_uv = reinterpret_cast<std::uint16_t*>(
+                destination->data[1] + y * destination->linesize[1]);
+            for (int x = 0; x < chroma_width; ++x) {
+                destination_uv[x * 2] = static_cast<std::uint16_t>((source_u[x] & 0x03ffU) << 6U);
+                destination_uv[x * 2 + 1] = static_cast<std::uint16_t>((source_v[x] & 0x03ffU) << 6U);
+            }
+        }
+        return Result<void>::Ok();
+    }
+
+    const char* source_name = av_get_pix_fmt_name(source_format);
+    const char* destination_name = av_get_pix_fmt_name(destination_format);
+    return Result<void>::Fail({
+        "software_decode_format_unsupported",
+        "The low-resolution software decoder produced an unsupported pixel format.",
+        std::string(source_name != nullptr ? source_name : "unknown") + " -> " +
+            (destination_name != nullptr ? destination_name : "unknown")
+    });
 }
 
 Result<void> set_required_encoder_option(AVCodecContext* context, const char* name, const char* value) {
@@ -383,35 +456,60 @@ Result<D3d11DevicePair> create_d3d11_device() {
     };
 
     const UINT flags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-    HRESULT result = D3D11CreateDevice(
-        nullptr,
-        D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,
-        flags,
-        feature_levels_with_11_1,
-        static_cast<UINT>(std::size(feature_levels_with_11_1)),
-        D3D11_SDK_VERSION,
-        pair.device.ReleaseAndGetAddressOf(),
-        &created_feature_level,
-        pair.context.ReleaseAndGetAddressOf());
-    if (result == E_INVALIDARG) {
-        result = D3D11CreateDevice(
-            nullptr,
-            D3D_DRIVER_TYPE_HARDWARE,
+
+    // Optimus laptops and virtual display adapters can shift the default DXGI
+    // adapter (an iGPU or a virtual adapter may be picked as the default).
+    // NVENC and NGX both require an NVIDIA device, so enumerate adapters and
+    // prefer the NVIDIA one explicitly; fall back to the system default only
+    // when no NVIDIA adapter is present.
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> nvidia_adapter;
+    {
+        Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), &factory))) {
+            for (UINT index = 0;; ++index) {
+                Microsoft::WRL::ComPtr<IDXGIAdapter1> candidate;
+                if (factory->EnumAdapters1(index, &candidate) == DXGI_ERROR_NOT_FOUND) break;
+                DXGI_ADAPTER_DESC1 desc{};
+                if (FAILED(candidate->GetDesc1(&desc))) continue;
+                if (desc.VendorId == 0x10DE) {
+                    nvidia_adapter = candidate;
+                    break;
+                }
+            }
+        }
+    }
+
+    auto open_device = [&](const D3D_FEATURE_LEVEL* levels, UINT count) {
+        return D3D11CreateDevice(
+            nvidia_adapter ? nvidia_adapter.Get() : nullptr,
+            nvidia_adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
             nullptr,
             flags,
-            feature_levels,
-            static_cast<UINT>(std::size(feature_levels)),
+            levels,
+            count,
             D3D11_SDK_VERSION,
             pair.device.ReleaseAndGetAddressOf(),
             &created_feature_level,
             pair.context.ReleaseAndGetAddressOf());
+    };
+
+    HRESULT result = open_device(feature_levels_with_11_1, static_cast<UINT>(std::size(feature_levels_with_11_1)));
+    if (result == E_INVALIDARG) {
+        result = open_device(feature_levels, static_cast<UINT>(std::size(feature_levels)));
     }
     if (FAILED(result)) {
         return Result<D3d11DevicePair>::Fail(hresult_error(
             "d3d11_device_create_failed",
             "A D3D11 hardware video device could not be created.",
             result));
+    }
+    if (nvidia_adapter) {
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(nvidia_adapter->GetDesc1(&desc))) {
+            std::wstring adapter_name(desc.Description);
+            log_info("D3D11 device created on NVIDIA adapter: " +
+                std::string(adapter_name.begin(), adapter_name.end()));
+        }
     }
 
     return Result<D3d11DevicePair>::Ok(std::move(pair));
@@ -756,7 +854,7 @@ Result<BufferRefPtr> create_encoder_frames_context(
     return Result<BufferRefPtr>::Ok(std::move(frames_ref));
 }
 
-Result<void> drain_encoder(AVCodecContext* encoder, AVFormatContext* output, AVStream* stream, AVPacket* packet, std::int64_t input_start_time_us) {
+Result<void> drain_encoder(AVCodecContext* encoder, AVFormatContext* output, AVStream* stream, AVPacket* packet) {
     for (;;) {
         av_packet_unref(packet);
         const int result = avcodec_receive_packet(encoder, packet);
@@ -771,20 +869,15 @@ Result<void> drain_encoder(AVCodecContext* encoder, AVFormatContext* output, AVS
         }
 
         packet->stream_index = stream->index;
-        av_packet_rescale_ts(packet, encoder->time_base, stream->time_base);
-        if (input_start_time_us > 0) {
-            // Blu-ray m2ts sources commonly carry a large start timestamp
-            // baseline (e.g. 600s). Strip it so the output timeline starts at
-            // zero, mirroring the ffmpeg CLI's default behavior for direct
-            // libavformat muxing.
-            const auto shift = av_rescale_q(input_start_time_us, AV_TIME_BASE_Q, stream->time_base);
-            if (packet->pts != AV_NOPTS_VALUE) {
-                packet->pts = std::max<std::int64_t>(0, packet->pts - shift);
-            }
-            if (packet->dts != AV_NOPTS_VALUE) {
-                packet->dts = std::max<std::int64_t>(0, packet->dts - shift);
-            }
+        if (packet->duration == 0) {
+            // D3D11VA-decoded frames carry no duration, so NVENC packets lose
+            // it too. movenc then computes a track duration one frame short
+            // and the demuxer's edit list marks the final frame as DISCARD.
+            // time_base is 1/fps, so exactly one unit is one frame.
+            packet->duration = 1;
         }
+        av_packet_rescale_ts(packet, encoder->time_base, stream->time_base);
+        // 输入 PTS 已在编码前归零，保留编码器重排产生的负 DTS。
 
         const int write_result = av_interleaved_write_frame(output, packet);
         if (write_result < 0) {
@@ -849,12 +942,17 @@ Result<void> FfmpegTranscodePipeline::run(
     if (!input_exists) {
         return Result<void>::Fail({"input_not_found", "Input file does not exist.", request.input_path});
     }
+    const bool frame_pipe_output = !request.output.frame_pipe_path.empty();
     const std::filesystem::path final_output_path = path_from_utf8(request.output_path);
-    const auto output_target = ffmpeg_validate_output_target(final_output_path);
-    if (!output_target.ok()) {
-        return Result<void>::Fail(output_target.error());
+    if (!frame_pipe_output) {
+        const auto output_target = ffmpeg_validate_output_target(final_output_path);
+        if (!output_target.ok()) {
+            return Result<void>::Fail(output_target.error());
+        }
     }
-    const std::filesystem::path temporary_output_path = ffmpeg_temporary_output_path(final_output_path);
+    const std::filesystem::path temporary_output_path = frame_pipe_output
+        ? path_from_utf8(request.output.frame_pipe_path)
+        : ffmpeg_temporary_output_path(final_output_path);
     TemporaryOutputCleanupGuard temporary_output_cleanup(temporary_output_path);
 
     if (rtx_ == nullptr) {
@@ -967,10 +1065,21 @@ Result<void> FfmpegTranscodePipeline::run(
             result));
     }
     decoder_context->pkt_timebase = input_stream->time_base;
-    decoder_context->get_format = choose_d3d11_format;
-    decoder_context->hw_device_ctx = av_buffer_ref(hw_device.value().get());
-    if (decoder_context->hw_device_ctx == nullptr) {
-        return Result<void>::Fail({"d3d11va_device_ref_failed", "FFmpeg could not reference the D3D11VA device context for decoding.", ""});
+    // 部分 D3D11VA 解码器会拒绝很小的编码表面（例如 192x128 HEVC）。
+    // 小分辨率素材本身开销很低，直接软件解码后上传到同一 D3D11 设备，
+    // RTX 处理及后续输出仍保持 GPU 路径，且不改变画面尺寸。
+    const bool software_decode_fallback =
+        decoder_context->width < 320 || decoder_context->height < 240;
+    if (!software_decode_fallback) {
+        decoder_context->get_format = choose_d3d11_format;
+        decoder_context->hw_device_ctx = av_buffer_ref(hw_device.value().get());
+        if (decoder_context->hw_device_ctx == nullptr) {
+            return Result<void>::Fail({"d3d11va_device_ref_failed", "FFmpeg could not reference the D3D11VA device context for decoding.", ""});
+        }
+    } else {
+        log_info(
+            "Low-resolution input uses software decode and D3D11 upload: " +
+            std::to_string(decoder_context->width) + "x" + std::to_string(decoder_context->height));
     }
 
     result = avcodec_open2(decoder_context.get(), decoder, nullptr);
@@ -981,6 +1090,22 @@ Result<void> FfmpegTranscodePipeline::run(
             result));
     }
 
+    BufferRefPtr decoder_upload_frames;
+    const AVPixelFormat decoder_upload_format = decoder_pixel_depth(decoder_context.get()) > 8
+        ? AV_PIX_FMT_P010LE
+        : AV_PIX_FMT_NV12;
+    if (software_decode_fallback) {
+        auto upload_frames = create_encoder_frames_context(
+            hw_device.value().get(),
+            decoder_upload_format,
+            decoder_context->width,
+            decoder_context->height);
+        if (!upload_frames.ok()) {
+            return Result<void>::Fail(upload_frames.error());
+        }
+        decoder_upload_frames = std::move(upload_frames.value());
+    }
+
     AVFormatContext* raw_output = nullptr;
     const std::string final_output_string = path_to_utf8(final_output_path);
     const std::string temporary_output_string = path_to_utf8(temporary_output_path);
@@ -989,7 +1114,9 @@ Result<void> FfmpegTranscodePipeline::run(
     // the target container cannot hold surface as the muxer's own errors when
     // the header is written.
     const char* output_format_name = nullptr;
-    if (request.output.container != "auto" && !request.output.container.empty()) {
+    if (frame_pipe_output) {
+        output_format_name = "rawvideo";
+    } else if (request.output.container != "auto" && !request.output.container.empty()) {
         output_format_name = request.output.container.c_str();
     } else {
         const AVOutputFormat* guessed = av_guess_format(nullptr, final_output_string.c_str(), nullptr);
@@ -1010,14 +1137,14 @@ Result<void> FfmpegTranscodePipeline::run(
     OutputFormatContextPtr output(raw_output);
 
     const bool hdr_enabled = request.processing.hdr.enabled;
-    const char* encoder_name = ffmpeg_nvenc_encoder_name(request.output);
+    const char* encoder_name = frame_pipe_output ? "rawvideo" : ffmpeg_nvenc_encoder_name(request.output);
     const bool av1_encoder = std::string_view(encoder_name) == "av1_nvenc";
     const bool hevc_encoder = std::string_view(encoder_name) == "hevc_nvenc";
     const AVCodec* encoder = avcodec_find_encoder_by_name(encoder_name);
     if (encoder == nullptr) {
         return Result<void>::Fail({
-            "nvenc_encoder_missing",
-            "FFmpeg does not expose the required NVENC encoder.",
+            "video_encoder_missing",
+            "FFmpeg does not expose the required video encoder.",
             encoder_name
         });
     }
@@ -1028,7 +1155,10 @@ Result<void> FfmpegTranscodePipeline::run(
     // Keep TrueHDR's packed RGB10 output intact. NVENC accepts X2BGR10
     // directly; an extra D3D11 VideoProcessor RGB10 -> P010 pass corrupts
     // chroma on the affected driver path.
-    const AVPixelFormat encoder_sw_format = hdr_enabled ? AV_PIX_FMT_X2BGR10 : AV_PIX_FMT_NV12;
+    const AVPixelFormat encoder_sw_format = hdr_enabled
+        ? AV_PIX_FMT_X2BGR10
+        : (request.output.pixel_format == "p010le" ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12);
+    const bool ten_bit_output = hdr_enabled || encoder_sw_format == AV_PIX_FMT_P010LE;
     const DXGI_FORMAT encoder_dxgi_format = dxgi_format_for_encoder_surface(encoder_sw_format);
     const DXGI_FORMAT rtx_input_dxgi_format = dxgi_format_for_rtx_input_surface(decoder_context.get());
     const DXGI_FORMAT rtx_output_dxgi_format = dxgi_format_for_rtx_output_surface(decoder_context.get(), hdr_enabled);
@@ -1053,8 +1183,10 @@ Result<void> FfmpegTranscodePipeline::run(
     encoder_context->height = output_height;
     encoder_context->time_base = av_inv_q(frame_rate);
     encoder_context->framerate = frame_rate;
-    encoder_context->pix_fmt = AV_PIX_FMT_D3D11;
+    encoder_context->pix_fmt = frame_pipe_output ? encoder_sw_format : AV_PIX_FMT_D3D11;
     encoder_context->sw_pix_fmt = encoder_sw_format;
+    // 保留 NVENC 预设的 B 帧设置：UHQ 与强制零 B 帧组合会初始化失败。
+    // 尾帧时长由 drain_encoder 补齐，并保留重排产生的负 DTS。
     encoder_context->sample_aspect_ratio = decoder_context->sample_aspect_ratio;
     const std::int64_t source_bit_rate = source_video_bit_rate(input.get(), input_stream, decoder_context.get());
     const std::int64_t target_bit_rate = ffmpeg_recommended_nvenc_bitrate(
@@ -1068,9 +1200,11 @@ Result<void> FfmpegTranscodePipeline::run(
     encoder_context->bit_rate = target_bit_rate;
     encoder_context->rc_max_rate = target_bit_rate + (target_bit_rate / 2);
     encoder_context->rc_buffer_size = target_bit_rate * 2;
-    encoder_context->hw_frames_ctx = av_buffer_ref(encoder_frames.value().get());
-    if (encoder_context->hw_frames_ctx == nullptr) {
-        return Result<void>::Fail({"encoder_frames_ref_failed", "FFmpeg could not reference the encoder D3D11 frames.", ""});
+    if (!frame_pipe_output) {
+        encoder_context->hw_frames_ctx = av_buffer_ref(encoder_frames.value().get());
+        if (encoder_context->hw_frames_ctx == nullptr) {
+            return Result<void>::Fail({"encoder_frames_ref_failed", "FFmpeg could not reference the encoder D3D11 frames.", ""});
+        }
     }
     if (output->oformat != nullptr && (output->oformat->flags & AVFMT_GLOBALHEADER) != 0) {
         encoder_context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -1080,6 +1214,8 @@ Result<void> FfmpegTranscodePipeline::run(
         encoder_context->color_trc = AVCOL_TRC_SMPTE2084;
         encoder_context->colorspace = AVCOL_SPC_BT2020_NCL;
         encoder_context->color_range = AVCOL_RANGE_MPEG;
+    }
+    if (ten_bit_output && !frame_pipe_output) {
         if (hevc_encoder) {
             encoder_context->profile = 2;
             const auto profile = set_required_encoder_option(encoder_context.get(), "profile", "main10");
@@ -1097,20 +1233,23 @@ Result<void> FfmpegTranscodePipeline::run(
                 return Result<void>::Fail(high_bit_depth.error());
             }
         }
-    } else {
+    }
+    if (!hdr_enabled) {
         encoder_context->color_primaries = decoder_context->color_primaries;
         encoder_context->color_trc = decoder_context->color_trc;
         encoder_context->colorspace = decoder_context->colorspace;
         encoder_context->color_range = decoder_context->color_range;
     }
-    const auto quality_configured = configure_nvenc_quality(
-        encoder_context.get(),
-        request.output,
-        hevc_encoder || av1_encoder);
-    if (!quality_configured.ok()) {
-        return Result<void>::Fail(quality_configured.error());
+    if (!frame_pipe_output) {
+        const auto quality_configured = configure_nvenc_quality(
+            encoder_context.get(),
+            request.output,
+            hevc_encoder || av1_encoder);
+        if (!quality_configured.ok()) {
+            return Result<void>::Fail(quality_configured.error());
+        }
     }
-    if (av1_encoder) {
+    if (av1_encoder && !frame_pipe_output) {
         const auto level = select_av1_level(
             output_width, output_height, av_q2d(frame_rate),
             encoder_context->rc_max_rate, encoder_context->rc_buffer_size);
@@ -1128,18 +1267,22 @@ Result<void> FfmpegTranscodePipeline::run(
         log_info("AV1 level configured: index=" + std::to_string(level.value().index) +
             ", tier=" + std::to_string(level.value().tier));
     }
-    log_info(
-        "NVENC quality configured: encoder=" + std::string(encoder_name) +
-        ", cq=" + std::to_string(nvenc_target_quality(request.output.video_codec)) +
-        ", target_bitrate=" + std::to_string(target_bit_rate) +
-        ", maxrate=" + std::to_string(encoder_context->rc_max_rate) +
-        ", buffer=" + std::to_string(encoder_context->rc_buffer_size));
+    if (!frame_pipe_output) {
+        log_info(
+            "NVENC quality configured: encoder=" + std::string(encoder_name) +
+            ", cq=" + std::to_string(nvenc_target_quality(request.output.video_codec)) +
+            ", target_bitrate=" + std::to_string(target_bit_rate) +
+            ", maxrate=" + std::to_string(encoder_context->rc_max_rate) +
+            ", buffer=" + std::to_string(encoder_context->rc_buffer_size));
+    } else {
+        log_info("RTX frame pipe configured: format=" + std::string(av_get_pix_fmt_name(encoder_sw_format)));
+    }
 
     result = avcodec_open2(encoder_context.get(), encoder, nullptr);
     if (result < 0) {
         return Result<void>::Fail(ffmpeg_error(
             "encoder_open_failed",
-            "FFmpeg could not open the NVENC encoder.",
+            "FFmpeg could not open the video encoder.",
             result));
     }
 
@@ -1166,6 +1309,8 @@ Result<void> FfmpegTranscodePipeline::run(
         AVStream* output_stream = nullptr;
     };
     std::vector<CopiedStream> copied_streams(input->nb_streams);
+    int audio_ordinal = 0;
+    int subtitle_ordinal = 0;
     if (ffmpeg_requests_stream_copy(request.output)) {
         for (unsigned int index = 0; index < input->nb_streams; ++index) {
             if (static_cast<int>(index) == video_stream_index) {
@@ -1179,7 +1324,13 @@ Result<void> FfmpegTranscodePipeline::run(
 
             const AVMediaType media_type = source_stream->codecpar->codec_type;
             if (media_type == AVMEDIA_TYPE_AUDIO) {
+                const int current_ordinal = audio_ordinal++;
                 if (request.output.audio_mode != "copy") {
+                    continue;
+                }
+                if (request.output.audio_stream_indices.has_value() &&
+                    !std::binary_search(request.output.audio_stream_indices->begin(),
+                        request.output.audio_stream_indices->end(), current_ordinal)) {
                     continue;
                 }
                 // MPEG-TS/Blu-ray demuxing often leaves audio parameters unset.
@@ -1196,7 +1347,13 @@ Result<void> FfmpegTranscodePipeline::run(
                     continue;
                 }
             } else if (media_type == AVMEDIA_TYPE_SUBTITLE) {
+                const int current_ordinal = subtitle_ordinal++;
                 if (request.output.subtitle_mode != "copy-compatible") {
+                    continue;
+                }
+                if (request.output.subtitle_stream_indices.has_value() &&
+                    !std::binary_search(request.output.subtitle_stream_indices->begin(),
+                        request.output.subtitle_stream_indices->end(), current_ordinal)) {
                     continue;
                 }
             } else {
@@ -1251,7 +1408,11 @@ Result<void> FfmpegTranscodePipeline::run(
     PacketPtr encoder_packet(av_packet_alloc());
     FramePtr decoded_frame(av_frame_alloc());
     FramePtr encoder_frame(av_frame_alloc());
-    if (!packet || !encoder_packet || !decoded_frame || !encoder_frame) {
+    FramePtr downloaded_frame(av_frame_alloc());
+    FramePtr converted_decoder_frame(av_frame_alloc());
+    FramePtr uploaded_decoder_frame(av_frame_alloc());
+    if (!packet || !encoder_packet || !decoded_frame || !encoder_frame || !downloaded_frame
+        || !converted_decoder_frame || !uploaded_decoder_frame) {
         return Result<void>::Fail({"ffmpeg_frame_alloc_failed", "FFmpeg could not allocate decode buffers.", ""});
     }
 
@@ -1311,7 +1472,51 @@ Result<void> FfmpegTranscodePipeline::run(
         if (cancellation.requested.load()) {
             return canceled_result("before processing decoded frame");
         }
-        if (frame->format != AV_PIX_FMT_D3D11 || frame->data[0] == nullptr) {
+        AVFrame* d3d11_frame = frame;
+        if (software_decode_fallback) {
+            AVFrame* upload_source = frame;
+            const auto source_format = static_cast<AVPixelFormat>(frame->format);
+            if (source_format != decoder_upload_format) {
+                av_frame_unref(converted_decoder_frame.get());
+                converted_decoder_frame->format = decoder_upload_format;
+                converted_decoder_frame->width = frame->width;
+                converted_decoder_frame->height = frame->height;
+                result = av_frame_get_buffer(converted_decoder_frame.get(), 32);
+                if (result < 0) {
+                    return Result<void>::Fail(ffmpeg_error(
+                        "software_decode_buffer_failed",
+                        "FFmpeg could not allocate the low-resolution upload frame.",
+                        result));
+                }
+                const auto converted = convert_software_frame_for_d3d11_upload(
+                    frame,
+                    converted_decoder_frame.get(),
+                    decoder_upload_format);
+                if (!converted.ok()) {
+                    return converted;
+                }
+                upload_source = converted_decoder_frame.get();
+            }
+
+            av_frame_unref(uploaded_decoder_frame.get());
+            result = av_hwframe_get_buffer(decoder_upload_frames.get(), uploaded_decoder_frame.get(), 0);
+            if (result < 0) {
+                return Result<void>::Fail(ffmpeg_error(
+                    "decoder_upload_buffer_failed",
+                    "FFmpeg could not allocate a D3D11 frame for low-resolution input.",
+                    result));
+            }
+            result = av_hwframe_transfer_data(uploaded_decoder_frame.get(), upload_source, 0);
+            if (result < 0) {
+                return Result<void>::Fail(ffmpeg_error(
+                    "decoder_upload_failed",
+                    "FFmpeg could not upload the low-resolution frame to D3D11.",
+                    result));
+            }
+            d3d11_frame = uploaded_decoder_frame.get();
+        }
+
+        if (d3d11_frame->format != AV_PIX_FMT_D3D11 || d3d11_frame->data[0] == nullptr) {
             return Result<void>::Fail({
                 "d3d11_frame_required",
                 "The hardware pipeline requires FFmpeg D3D11VA frames.",
@@ -1319,8 +1524,8 @@ Result<void> FfmpegTranscodePipeline::run(
             });
         }
 
-        auto* decoded_texture = reinterpret_cast<ID3D11Texture2D*>(frame->data[0]);
-        const UINT decoded_slice = static_cast<UINT>(reinterpret_cast<intptr_t>(frame->data[1]));
+        auto* decoded_texture = reinterpret_cast<ID3D11Texture2D*>(d3d11_frame->data[0]);
+        const UINT decoded_slice = static_cast<UINT>(reinterpret_cast<intptr_t>(d3d11_frame->data[1]));
 
         if (rtx_input_textures.empty()) {
             rtx_input_textures.resize(rtx_input_ring_size);
@@ -1455,6 +1660,10 @@ Result<void> FfmpegTranscodePipeline::run(
         encoder_frame->pts = frame->pts == AV_NOPTS_VALUE
             ? frames_done
             : av_rescale_q(frame->pts, input_stream->time_base, encoder_context->time_base);
+        // 在送入编码器前归零；NVENC 的重排 DTS 依赖输入 PTS，封装前再减偏移过晚。
+        if (frame->pts != AV_NOPTS_VALUE && input_start_time_us > 0) {
+            encoder_frame->pts -= av_rescale_q(input_start_time_us, AV_TIME_BASE_Q, encoder_context->time_base);
+        }
         encoder_frame->duration = frame->duration > 0
             ? av_rescale_q(frame->duration, input_stream->time_base, encoder_context->time_base)
             : 0;
@@ -1462,17 +1671,36 @@ Result<void> FfmpegTranscodePipeline::run(
         encoder_frame->height = output_height;
         encoder_frame->format = AV_PIX_FMT_D3D11;
 
-        result = avcodec_send_frame(encoder_context.get(), encoder_frame.get());
+        AVFrame* frame_to_encode = encoder_frame.get();
+        if (frame_pipe_output) {
+            av_frame_unref(downloaded_frame.get());
+            result = av_hwframe_transfer_data(downloaded_frame.get(), encoder_frame.get(), 0);
+            if (result < 0) {
+                return Result<void>::Fail(ffmpeg_error(
+                    "frame_download_failed",
+                    "FFmpeg could not download the RTX frame for the 3FUI encoder.",
+                    result));
+            }
+            downloaded_frame->pts = encoder_frame->pts;
+            downloaded_frame->duration = encoder_frame->duration;
+            downloaded_frame->color_primaries = encoder_context->color_primaries;
+            downloaded_frame->color_trc = encoder_context->color_trc;
+            downloaded_frame->colorspace = encoder_context->colorspace;
+            downloaded_frame->color_range = encoder_context->color_range;
+            frame_to_encode = downloaded_frame.get();
+        }
+
+        result = avcodec_send_frame(encoder_context.get(), frame_to_encode);
         if (result < 0) {
             return Result<void>::Fail(ffmpeg_error(
                 "encoder_send_frame_failed",
-                "NVENC could not accept a processed frame.",
+                "The video encoder could not accept a processed frame.",
                 result));
         }
         ++frames_done;
         emit_progress(JobStage::encoding, frames_done);
 
-        return drain_encoder(encoder_context.get(), output.get(), output_stream, encoder_packet.get(), input_start_time_us);
+        return drain_encoder(encoder_context.get(), output.get(), output_stream, encoder_packet.get());
     };
 
     auto receive_decoder_frames = [&]() -> Result<void> {
@@ -1577,10 +1805,10 @@ Result<void> FfmpegTranscodePipeline::run(
     if (result < 0) {
         return Result<void>::Fail(ffmpeg_error(
             "encoder_flush_failed",
-            "NVENC could not flush.",
+            "The video encoder could not flush.",
             result));
     }
-    const auto encoded_flush = drain_encoder(encoder_context.get(), output.get(), output_stream, encoder_packet.get(), input_start_time_us);
+    const auto encoded_flush = drain_encoder(encoder_context.get(), output.get(), output_stream, encoder_packet.get());
     if (!encoded_flush.ok()) {
         return Result<void>::Fail(encoded_flush.error());
     }
@@ -1590,7 +1818,8 @@ Result<void> FfmpegTranscodePipeline::run(
         muxing.stage = JobStage::muxing;
         muxing.progress = 0.99;
         muxing.frames_done = frames_done;
-        muxing.frames_total = frames_total;
+        // 容器时长只能给出估算值；解码完成后用实际处理帧数纠正总数。
+        muxing.frames_total = frames_done;
         muxing.fps = smoothed_fps;
         muxing.eta_seconds = 0;
         progress(muxing);
@@ -1617,9 +1846,11 @@ Result<void> FfmpegTranscodePipeline::run(
         }
     }
 
-    const auto replaced = ffmpeg_replace_output_file(temporary_output_path, final_output_path);
-    if (!replaced.ok()) {
-        return Result<void>::Fail(replaced.error());
+    if (!frame_pipe_output) {
+        const auto replaced = ffmpeg_replace_output_file(temporary_output_path, final_output_path);
+        if (!replaced.ok()) {
+            return Result<void>::Fail(replaced.error());
+        }
     }
     temporary_output_cleanup.release();
 
@@ -1630,7 +1861,7 @@ Result<void> FfmpegTranscodePipeline::run(
         finalizing.stage = JobStage::finalizing;
         finalizing.progress = 1.0;
         finalizing.frames_done = frames_done;
-        finalizing.frames_total = frames_total;
+        finalizing.frames_total = frames_done;
         finalizing.fps = smoothed_fps;
         finalizing.eta_seconds = 0;
         progress(finalizing);

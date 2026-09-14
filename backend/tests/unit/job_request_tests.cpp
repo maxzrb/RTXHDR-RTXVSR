@@ -117,6 +117,72 @@ TEST(JobRequestValidation, rejectsH264ForHdrOutput) {
     EXPECT_EQ(result.error().code, "hdr_requires_10bit_codec");
 }
 
+TEST(JobRequestValidation, rejectsH264WithP010Output) {
+    TranscodeRequest request;
+    request.input_path = "C:\\Videos\\in.mp4";
+    request.output_path = "C:\\Videos\\out.mp4";
+    request.processing.vsr.enabled = true;
+    request.output.video_codec = "h264";
+    request.output.pixel_format = "p010le";
+
+    const auto result = validate_request(request);
+
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().code, "h264_10bit_unsupported");
+}
+
+TEST(JobRequestValidation, rejectsUnsortedOrDuplicateStreamSelection) {
+    TranscodeRequest request;
+    request.input_path = "C:\\Videos\\in.mp4";
+    request.output_path = "C:\\Videos\\out.mp4";
+    request.processing.vsr.enabled = true;
+    request.output.audio_stream_indices = std::vector<int>{1, 1};
+
+    const auto result = validate_request(request);
+
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().code, "invalid_stream_selection");
+}
+
+TEST(JobRequestValidation, acceptsVideoOnlyFramePipeJob) {
+    TranscodeRequest request;
+    request.input_path = "C:\\Videos\\in.mp4";
+    request.output_path = "C:\\Videos\\out.mkv";
+    request.processing.vsr.enabled = true;
+    request.output.audio_mode = "none";
+    request.output.subtitle_mode = "none";
+    request.output.frame_pipe_path = "\\\\.\\pipe\\videoenhancer-rtx-test";
+
+    EXPECT_TRUE(validate_request(request).ok());
+}
+
+TEST(JobRequestValidation, acceptsP010FramePipeWithoutRequiringSidecarNvenc) {
+    TranscodeRequest request;
+    request.input_path = "C:\\Videos\\in.mp4";
+    request.output_path = "C:\\Videos\\out.mkv";
+    request.processing.vsr.enabled = true;
+    request.output.video_codec = "h264";
+    request.output.pixel_format = "p010le";
+    request.output.audio_mode = "none";
+    request.output.subtitle_mode = "none";
+    request.output.frame_pipe_path = "\\\\.\\pipe\\videoenhancer-rtx-test";
+
+    EXPECT_TRUE(validate_request(request).ok());
+}
+
+TEST(JobRequestValidation, rejectsFramePipeThatAlsoCopiesStreams) {
+    TranscodeRequest request;
+    request.input_path = "C:\\Videos\\in.mp4";
+    request.output_path = "C:\\Videos\\out.mkv";
+    request.processing.vsr.enabled = true;
+    request.output.frame_pipe_path = "\\\\.\\pipe\\videoenhancer-rtx-test";
+
+    const auto result = validate_request(request);
+
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().code, "frame_pipe_video_only");
+}
+
 TEST(JobRequestValidation, acceptsExplicitlyDroppingAudioAndSubtitles) {
     TranscodeRequest request;
     request.input_path = "C:\\Videos\\in.mp4";

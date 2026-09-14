@@ -26,8 +26,16 @@ Result<TranscodeRequest> parse_transcode_request(const nlohmann::json& json) {
         const auto output = json.value("output", nlohmann::json::object());
         request.output.container = output.value("container", "mp4");
         request.output.video_codec = output.value("videoCodec", request.processing.hdr.enabled ? "hevc" : "h264");
+        request.output.pixel_format = output.value("pixelFormat", request.processing.hdr.enabled ? "p010le" : "auto");
         request.output.audio_mode = output.value("audioMode", "copy");
         request.output.subtitle_mode = output.value("subtitleMode", "copy-compatible");
+        request.output.frame_pipe_path = output.value("framePipePath", "");
+        if (output.contains("audioStreamIndices")) {
+            request.output.audio_stream_indices = output.at("audioStreamIndices").get<std::vector<int>>();
+        }
+        if (output.contains("subtitleStreamIndices")) {
+            request.output.subtitle_stream_indices = output.at("subtitleStreamIndices").get<std::vector<int>>();
+        }
 
         if (output.contains("encoderOptions") && output.at("encoderOptions").is_object()) {
             for (const auto& [name, value] : output.at("encoderOptions").items()) {
