@@ -332,3 +332,74 @@ TEST(FfmpegTranscodePipelineStreams, copiesInputDisplayMatrixToEncodedVideoParam
 }
 
 #endif
+
+#if defined(VSR_ENABLE_FFMPEG)
+extern "C" {
+#include <libavutil/frame.h>
+}
+namespace vsr {
+Result<void> convert_software_frame_for_d3d11_upload(const AVFrame*, AVFrame*, AVPixelFormat);
+}
+
+// 用已知颜色和灰阶验证转换，避免“能输出”掩盖通道或中性色度错误。
+TEST(FfmpegSoftwareUpload, convertsBgrAndPaletteRedWithCorrectChannels) {
+    std::array<std::uint8_t, 12> bgr = {0,0,255, 0,0,255, 0,0,255, 0,0,255};
+    std::array<std::uint8_t, 4> indices = {1,1,1,1};
+    std::array<std::uint32_t, 256> palette{};
+    palette[1] = 0xffff0000U;
+    for (const auto format : {AV_PIX_FMT_BGR24, AV_PIX_FMT_PAL8}) {
+        AVFrame source{};
+        source.width = source.height = 2;
+        source.format = format;
+        source.data[0] = format == AV_PIX_FMT_PAL8 ? indices.data() : bgr.data();
+        source.data[1] = reinterpret_cast<std::uint8_t*>(palette.data());
+        source.linesize[0] = format == AV_PIX_FMT_PAL8 ? 2 : 6;
+        std::array<std::uint8_t, 4> luma{};
+        std::array<std::uint8_t, 2> chroma{};
+        AVFrame destination{};
+        destination.data[0] = luma.data();
+        destination.data[1] = chroma.data();
+        destination.linesize[0] = destination.linesize[1] = 2;
+        ASSERT_TRUE(vsr::convert_software_frame_for_d3d11_upload(&source, &destination, AV_PIX_FMT_NV12).ok());
+        for (const auto value : luma) EXPECT_EQ(value, 63);
+        EXPECT_EQ(chroma[0], 102);
+        EXPECT_EQ(chroma[1], 240);
+    }
+}
+
+TEST(FfmpegSoftwareUpload, preservesGrayAndAddsNeutralChroma) {
+    std::array<std::uint8_t, 4> pixels = {0,85,170,255};
+    std::array<std::uint8_t, 4> luma{};
+    std::array<std::uint8_t, 2> chroma{};
+    AVFrame source{}, destination{};
+    source.width = source.height = 2;
+    source.format = AV_PIX_FMT_GRAY8;
+    source.data[0] = pixels.data();
+    source.linesize[0] = 2;
+    destination.data[0] = luma.data();
+    destination.data[1] = chroma.data();
+    destination.linesize[0] = destination.linesize[1] = 2;
+    ASSERT_TRUE(vsr::convert_software_frame_for_d3d11_upload(&source, &destination, AV_PIX_FMT_NV12).ok());
+    EXPECT_EQ(luma, pixels);
+    EXPECT_EQ(chroma[0], 128);
+    EXPECT_EQ(chroma[1], 128);
+}
+
+TEST(FfmpegSoftwareUpload, readsPackedYuyvAndAveragesVerticalChroma) {
+    std::array<std::uint8_t, 8> pixels = {10,30,20,40, 11,50,21,60};
+    std::array<std::uint8_t, 4> luma{};
+    std::array<std::uint8_t, 2> chroma{};
+    AVFrame source{}, destination{};
+    source.width = source.height = 2;
+    source.format = AV_PIX_FMT_YUYV422;
+    source.data[0] = pixels.data();
+    source.linesize[0] = 4;
+    destination.data[0] = luma.data();
+    destination.data[1] = chroma.data();
+    destination.linesize[0] = destination.linesize[1] = 2;
+    ASSERT_TRUE(vsr::convert_software_frame_for_d3d11_upload(&source, &destination, AV_PIX_FMT_NV12).ok());
+    EXPECT_EQ(luma, (std::array<std::uint8_t, 4>{10,20,11,21}));
+    EXPECT_EQ(chroma[0], 40);
+    EXPECT_EQ(chroma[1], 50);
+}
+#endif
