@@ -19,7 +19,9 @@ extern "C" {
 
 #ifdef _WIN32
 #include <d3d11.h>
+#include <dxgi1_2.h>
 #include <windows.h>
+#include <wrl/client.h>
 #endif
 
 #if defined(VSR_ENABLE_FFMPEG) && defined(_WIN32)
@@ -31,6 +33,21 @@ extern "C" {
 namespace vsr {
 
 namespace {
+
+#ifdef _WIN32
+Microsoft::WRL::ComPtr<IDXGIAdapter1> nvidia_adapter_for_probe() {
+    // 与实际 RTX/NVENC 处理一致，避免混合显卡机器默认探测到集显。
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), &factory))) return {};
+    for (UINT index = 0;; ++index) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> candidate;
+        if (FAILED(factory->EnumAdapters1(index, &candidate))) break;
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(candidate->GetDesc1(&desc)) && desc.VendorId == 0x10DE) return candidate;
+    }
+    return {};
+}
+#endif
 
 bool file_exists(const std::filesystem::path& path) {
     std::error_code error;
@@ -116,6 +133,7 @@ bool detect_d3d11_available() {
 
 #if defined(VSR_ENABLE_RTX_SDK) && defined(_WIN32)
 bool detect_rtx_runtime_available(bool enable_hdr, bool enable_vsr) {
+    const auto adapter = nvidia_adapter_for_probe();
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
     D3D_FEATURE_LEVEL feature_level = {};
@@ -127,13 +145,13 @@ bool detect_rtx_runtime_available(bool enable_hdr, bool enable_vsr) {
     };
 
     HRESULT result = D3D11CreateDevice(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+        adapter.Get(), adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr,
         D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         levels, static_cast<UINT>(std::size(levels)), D3D11_SDK_VERSION,
         &device, &feature_level, &context);
     if (result == E_INVALIDARG) {
         result = D3D11CreateDevice(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+            adapter.Get(), adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr,
             D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             levels + 1, static_cast<UINT>(std::size(levels) - 1), D3D11_SDK_VERSION,
             &device, &feature_level, &context);
@@ -164,6 +182,7 @@ bool ffmpeg_encoder_available(const char* name) {
 
 #if defined(VSR_ENABLE_FFMPEG) && defined(_WIN32)
 bool detect_nvenc_d3d11_available_uncached(const char* encoder_name, AVPixelFormat software_format, bool ten_bit_hdr) {
+    const auto adapter = nvidia_adapter_for_probe();
     const AVCodec* encoder = avcodec_find_encoder_by_name(encoder_name);
     if (encoder == nullptr) {
         return false;
@@ -179,8 +198,8 @@ bool detect_nvenc_d3d11_available_uncached(const char* encoder_name, AVPixelForm
         D3D_FEATURE_LEVEL_10_0,
     };
     HRESULT d3d_result = D3D11CreateDevice(
-        nullptr,
-        D3D_DRIVER_TYPE_HARDWARE,
+        adapter.Get(),
+        adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
         nullptr,
         0,
         feature_levels,
@@ -191,8 +210,8 @@ bool detect_nvenc_d3d11_available_uncached(const char* encoder_name, AVPixelForm
         &context);
     if (d3d_result == E_INVALIDARG) {
         d3d_result = D3D11CreateDevice(
-            nullptr,
-            D3D_DRIVER_TYPE_HARDWARE,
+            adapter.Get(),
+            adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
             nullptr,
             0,
             feature_levels + 1,

@@ -191,7 +191,7 @@ Result<void> convert_software_frame_for_d3d11_upload(
     if (source == nullptr || destination == nullptr) {
         return Result<void>::Fail({
             "software_decode_conversion_failed",
-            "FFmpeg could not convert the low-resolution frame for D3D11 upload.",
+            "FFmpeg could not convert the software-decoded frame for D3D11 upload.",
             "Source or destination frame was null."
         });
     }
@@ -246,14 +246,54 @@ Result<void> convert_software_frame_for_d3d11_upload(
         return Result<void>::Ok();
     }
 
-    const char* source_name = av_get_pix_fmt_name(source_format);
-    const char* destination_name = av_get_pix_fmt_name(destination_format);
-    return Result<void>::Fail({
-        "software_decode_format_unsupported",
-        "The low-resolution software decoder produced an unsupported pixel format.",
-        std::string(source_name != nullptr ? source_name : "unknown") + " -> " +
-            (destination_name != nullptr ? destination_name : "unknown")
-    });
+    // 兼容常见 planar YUV 的 4:2:2/4:4:4 及 8/10/12/16 位输入，避免增加 DLL 依赖。
+    const AVPixFmtDescriptor* descriptor = av_pix_fmt_desc_get(source_format);
+    if (descriptor == nullptr || !(descriptor->flags & AV_PIX_FMT_FLAG_PLANAR) ||
+        (descriptor->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_BE)) ||
+        descriptor->nb_components < 3 || descriptor->comp[0].depth > 16) {
+        return Result<void>::Fail({"software_decode_format_unsupported",
+            "Software decoder produced an unsupported pixel format.",
+            av_get_pix_fmt_name(source_format) ? av_get_pix_fmt_name(source_format) : "unknown"});
+    }
+    const int depth = descriptor->comp[0].depth;
+    const bool ten_bit = destination_format == AV_PIX_FMT_P010LE;
+    auto read_sample = [&](int plane, int x, int y) -> unsigned int {
+        const std::uint8_t* row = source->data[plane] + y * source->linesize[plane];
+        return depth > 8 ? reinterpret_cast<const std::uint16_t*>(row)[x] : row[x];
+    };
+    auto convert_depth = [&](unsigned int value) -> unsigned int {
+        const int target_depth = ten_bit ? 10 : 8;
+        value = depth > target_depth ? value >> (depth - target_depth) : value << (target_depth - depth);
+        return ten_bit ? value << 6 : value;
+    };
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const unsigned int value = convert_depth(read_sample(0, x, y));
+            std::uint8_t* row = destination->data[0] + y * destination->linesize[0];
+            if (ten_bit) reinterpret_cast<std::uint16_t*>(row)[x] = static_cast<std::uint16_t>(value);
+            else row[x] = static_cast<std::uint8_t>(value);
+        }
+    }
+    for (int y = 0; y < chroma_height; ++y) {
+        for (int x = 0; x < chroma_width; ++x) {
+            for (int plane = 1; plane <= 2; ++plane) {
+                unsigned int sum = 0, count = 0;
+                const int x_first = (2 * x) >> descriptor->log2_chroma_w;
+                const int y_first = (2 * y) >> descriptor->log2_chroma_h;
+                const int x_end = (std::min(2 * x + 2, width) + (1 << descriptor->log2_chroma_w) - 1) >> descriptor->log2_chroma_w;
+                const int y_end = (std::min(2 * y + 2, height) + (1 << descriptor->log2_chroma_h) - 1) >> descriptor->log2_chroma_h;
+                for (int sy = y_first; sy < y_end; ++sy) {
+                    for (int sx = x_first; sx < x_end; ++sx) { sum += read_sample(plane, sx, sy); ++count; }
+                }
+                const unsigned int value = convert_depth((sum + count / 2) / count);
+                std::uint8_t* row = destination->data[1] + y * destination->linesize[1];
+                const int offset = 2 * x + plane - 1;
+                if (ten_bit) reinterpret_cast<std::uint16_t*>(row)[offset] = static_cast<std::uint16_t>(value);
+                else row[offset] = static_cast<std::uint8_t>(value);
+            }
+        }
+    }
+    return Result<void>::Ok();
 }
 
 Result<void> set_required_encoder_option(AVCodecContext* context, const char* name, const char* value) {
@@ -1053,42 +1093,76 @@ Result<void> FfmpegTranscodePipeline::run(
         return Result<void>::Fail(hw_device.error());
     }
 
-    CodecContextPtr decoder_context(avcodec_alloc_context3(decoder));
-    if (!decoder_context) {
-        return Result<void>::Fail({"decoder_context_alloc_failed", "FFmpeg could not allocate the decoder context.", ""});
-    }
-    result = avcodec_parameters_to_context(decoder_context.get(), input_stream->codecpar);
-    if (result < 0) {
-        return Result<void>::Fail(ffmpeg_error(
-            "decoder_parameters_failed",
-            "FFmpeg could not copy decoder parameters.",
-            result));
-    }
-    decoder_context->pkt_timebase = input_stream->time_base;
-    // 部分 D3D11VA 解码器会拒绝很小的编码表面（例如 192x128 HEVC）。
-    // 小分辨率素材本身开销很低，直接软件解码后上传到同一 D3D11 设备，
-    // RTX 处理及后续输出仍保持 GPU 路径，且不改变画面尺寸。
-    const bool software_decode_fallback =
-        decoder_context->width < 320 || decoder_context->height < 240;
-    if (!software_decode_fallback) {
-        decoder_context->get_format = choose_d3d11_format;
-        decoder_context->hw_device_ctx = av_buffer_ref(hw_device.value().get());
-        if (decoder_context->hw_device_ctx == nullptr) {
-            return Result<void>::Fail({"d3d11va_device_ref_failed", "FFmpeg could not reference the D3D11VA device context for decoding.", ""});
+    // 先查解码器硬解配置，再验证当前显卡能否解出首帧。
+    bool has_d3d11_decoder = false;
+    for (int index = 0; const AVCodecHWConfig* config = avcodec_get_hw_config(decoder, index); ++index) {
+        if (config->device_type == AV_HWDEVICE_TYPE_D3D11VA &&
+            config->pix_fmt == AV_PIX_FMT_D3D11 &&
+            (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
+            has_d3d11_decoder = true;
+            break;
         }
-    } else {
-        log_info(
-            "Low-resolution input uses software decode and D3D11 upload: " +
-            std::to_string(decoder_context->width) + "x" + std::to_string(decoder_context->height));
+    }
+    bool software_decode_fallback = !has_d3d11_decoder ||
+        input_stream->codecpar->width < 320 || input_stream->codecpar->height < 240;
+    CodecContextPtr decoder_context;
+    auto open_decoder = [&]() -> int {
+        decoder_context.reset(avcodec_alloc_context3(decoder));
+        if (!decoder_context) return AVERROR(ENOMEM);
+        int opened = avcodec_parameters_to_context(decoder_context.get(), input_stream->codecpar);
+        if (opened < 0) return opened;
+        decoder_context->pkt_timebase = input_stream->time_base;
+        if (!software_decode_fallback) {
+            decoder_context->get_format = choose_d3d11_format;
+            decoder_context->hw_device_ctx = av_buffer_ref(hw_device.value().get());
+            if (decoder_context->hw_device_ctx == nullptr) return AVERROR(ENOMEM);
+        }
+        return avcodec_open2(decoder_context.get(), decoder, nullptr);
+    };
+    result = open_decoder();
+    if (result < 0 && !software_decode_fallback) {
+        log_info("Hardware decoder initialization failed; retrying software decode.");
+        software_decode_fallback = true;
+        result = open_decoder();
+    }
+    if (result < 0) {
+        return Result<void>::Fail(ffmpeg_error("decoder_open_failed",
+            "FFmpeg could not open the video decoder.", result));
     }
 
-    result = avcodec_open2(decoder_context.get(), decoder, nullptr);
-    if (result < 0) {
-        return Result<void>::Fail(ffmpeg_error(
-            "decoder_open_failed",
-            "FFmpeg could not open the D3D11VA decoder.",
-            result));
+    // 保留首帧探测时的所有流数据包，稍后顺序重放，不丢起始音视频或字幕。
+    std::vector<PacketPtr> decoder_probe_packets;
+    if (!software_decode_fallback) {
+        FramePtr first_frame(av_frame_alloc());
+        if (!first_frame) return Result<void>::Fail({"decoder_probe_alloc_failed", "Could not allocate decoder probe frame.", ""});
+        int decoded = AVERROR(EAGAIN);
+        while (decoded == AVERROR(EAGAIN)) {
+            if (cancellation.requested.load()) return canceled_result("during decoder probe");
+            wait_while_job_paused(cancellation);
+            PacketPtr probe_packet(av_packet_alloc());
+            if (!probe_packet) return Result<void>::Fail({"decoder_probe_alloc_failed", "Could not allocate decoder probe packet.", ""});
+            int read = av_read_frame(input.get(), probe_packet.get());
+            if (read == AVERROR_EOF) {
+                decoded = avcodec_send_packet(decoder_context.get(), nullptr);
+                if (decoded >= 0) decoded = avcodec_receive_frame(decoder_context.get(), first_frame.get());
+                break;
+            }
+            if (read < 0) return Result<void>::Fail(ffmpeg_error("input_read_failed", "Could not read decoder probe packet.", read));
+            const bool video_packet = probe_packet->stream_index == video_stream_index;
+            decoder_probe_packets.push_back(std::move(probe_packet));
+            if (!video_packet) continue;
+            decoded = avcodec_send_packet(decoder_context.get(), decoder_probe_packets.back().get());
+            if (decoded >= 0) decoded = avcodec_receive_frame(decoder_context.get(), first_frame.get());
+        }
+        if (decoded < 0 || first_frame->format != AV_PIX_FMT_D3D11) {
+            log_info("Hardware first-frame decode failed; retrying software decode and D3D11 upload.");
+            software_decode_fallback = true;
+        }
+        result = open_decoder();
+        if (result < 0) return Result<void>::Fail(ffmpeg_error("decoder_open_failed", "Could not reopen video decoder.", result));
     }
+    log_info(std::string("Video decode route: ") + (software_decode_fallback ? "software + D3D11 upload" : "D3D11VA") +
+        "; codec=" + decoder->name + "; size=" + std::to_string(decoder_context->width) + "x" + std::to_string(decoder_context->height));
 
     BufferRefPtr decoder_upload_frames;
     const AVPixelFormat decoder_upload_format = decoder_pixel_depth(decoder_context.get()) > 8
@@ -1503,14 +1577,14 @@ Result<void> FfmpegTranscodePipeline::run(
             if (result < 0) {
                 return Result<void>::Fail(ffmpeg_error(
                     "decoder_upload_buffer_failed",
-                    "FFmpeg could not allocate a D3D11 frame for low-resolution input.",
+                    "FFmpeg could not allocate a D3D11 frame for software-decoded input.",
                     result));
             }
             result = av_hwframe_transfer_data(uploaded_decoder_frame.get(), upload_source, 0);
             if (result < 0) {
                 return Result<void>::Fail(ffmpeg_error(
                     "decoder_upload_failed",
-                    "FFmpeg could not upload the low-resolution frame to D3D11.",
+                    "FFmpeg could not upload the software-decoded frame to D3D11.",
                     result));
             }
             d3d11_frame = uploaded_decoder_frame.get();
@@ -1724,13 +1798,16 @@ Result<void> FfmpegTranscodePipeline::run(
         }
     };
 
+    std::size_t decoder_probe_index = 0;
     for (;;) {
         if (cancellation.requested.load()) {
             return canceled_result("while reading input");
         }
         wait_while_job_paused(cancellation);
         av_packet_unref(packet.get());
-        result = av_read_frame(input.get(), packet.get());
+        result = decoder_probe_index < decoder_probe_packets.size()
+            ? av_packet_ref(packet.get(), decoder_probe_packets[decoder_probe_index++].get())
+            : av_read_frame(input.get(), packet.get());
         if (result == AVERROR_EOF) {
             break;
         }
